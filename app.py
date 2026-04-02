@@ -21,37 +21,43 @@ st.markdown(
 # ── Constants ─────────────────────────────────────────────────────────────────
 SCALE      = 0.75
 PAGE_W_PDF = 595.32001
-PAGE_CX    = PAGE_W_PDF / 2   # 297.66  (center in PDF user-space)
-
-# Byte ranges of target BT..ET blocks inside the decompressed content stream.
-# These are fixed for every challan exported from Yash Gallery's software
-# because the software always produces the same structure.
-BLOCK_RANGES = {
-    "company":  (3970, 4341),   # "Yash Gallery Pvt Ltd"
-    "address":  (4375, 5518),   # address line
-    "gstin":    (5552, 5988),   # GSTIN line
-    "signature":(18563, 18998), # "For Yash Gallery Pvt Ltd"
-}
+PAGE_CX    = PAGE_W_PDF / 2   # Center in PDF user-space
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def stream_x_centered(text: str, font: str, pdf_size: float) -> float:
-    """Stream-space x so that `text` is horizontally centred on the page."""
+    """Calculate stream-space x coordinate for centered text."""
     w = pdfmetrics.stringWidth(text, font, pdf_size)
     return (PAGE_CX - w / 2) / SCALE
 
 
-def stream_x_right_aligned(new_text: str, orig_text: str,
-                            orig_sx: float, font: str, pdf_size: float) -> float:
-    """Stream-space x so that `new_text` ends at the same right edge as `orig_text`."""
-    orig_right = orig_sx * SCALE + pdfmetrics.stringWidth(orig_text, font, pdf_size)
-    new_w      = pdfmetrics.stringWidth(new_text, font, pdf_size)
-    return (orig_right - new_w) / SCALE
+def extract_position_from_bt_block(bt_block: bytes) -> tuple:
+    """Extract x, y position from a BT...ET block."""
+    # Pattern: 1 0 0.000000 -1 X Y Tm
+    tm_pattern = rb'1\s+0\s+[\d.]+\s+-1\s+([\d.]+)\s+([\d.]+)\s+Tm'
+    match = re.search(tm_pattern, bt_block)
+    if match:
+        sx = float(match.group(1))
+        sy = float(match.group(2))
+        return sx, sy
+    return None, None
+
+
+def extract_font_info_from_bt_block(bt_block: bytes) -> tuple:
+    """Extract font key and size from a BT...ET block."""
+    # Pattern: /FontKey FontSize Tf
+    font_pattern = rb'/([A-Z0-9]+)\s+([\d.]+)\s+Tf'
+    match = re.search(font_pattern, bt_block)
+    if match:
+        font_key = match.group(1).decode('latin-1')
+        font_size = float(match.group(2))
+        return font_key, font_size
+    return None, None
 
 
 def make_bt_block(sx: float, sy: float, font_key: str,
                   font_size_stream: float, text: str) -> bytes:
-    """Return a PDF BT…ET text block as bytes."""
+    """Create a PDF BT...ET text block."""
     escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
     return (
         f"BT\n0 Tr\n/{font_key} {font_size_stream:.6f} Tf\n"
@@ -60,77 +66,174 @@ def make_bt_block(sx: float, sy: float, font_key: str,
     ).encode("latin-1")
 
 
+def find_block_by_position_and_font(stream_data: bytes, y_pos: float, font_size: float, 
+                                   font_num: str = None, x_range: tuple = None) -> tuple:
+    """
+    Find a BT...ET block by its Y position and font size.
+    Returns (start, end, block) or (None, None, None).
+    """
+    # Find all BT...ET blocks
+    bt_blocks = re.findall(rb'BT.*?ET', stream_data, re.DOTALL)
+    
+    for block in bt_blocks:
+        # Extract font info
+        font_match = re.search(rb'/F(\d+)\s+([\d.]+)\s+Tf', block)
+        # Extract position: 1 0 0.000000 -1 X Y Tm
+        tm_match = re.search(rb'1\s+0\s+[\d.]+\s+-1\s+([\d.]+)\s+([\d.]+)\s+Tm', block)
+        
+        if font_match and tm_match:
+            block_font_num = font_match.group(1).decode()
+            block_font_size = float(font_match.group(2))
+            block_x = float(tm_match.group(1))
+            block_y = float(tm_match.group(2))
+            
+            # Check if this matches our criteria
+            y_match = abs(block_y - y_pos) < 5  # Allow 5-point tolerance
+            size_match = abs(block_font_size - font_size) < 1
+            font_match_check = (font_num is None) or (block_font_num == font_num)
+            x_match = (x_range is None) or (x_range[0] <= block_x <= x_range[1])
+            
+            if y_match and size_match and font_match_check and x_match:
+                start = stream_data.find(block)
+                end = start + len(block)
+                return start, end, block
+    
+    return None, None, None
+
+
 def add_helvetica_fonts(page) -> None:
-    """Add /FH (Helvetica) and /FHB (Helvetica-Bold) to the page font resources."""
-    resources  = page["/Resources"]
-    font_dict  = resources["/Font"]
+    """Add Helvetica fonts to page resources."""
+    resources = page["/Resources"]
+    font_dict = resources["/Font"]
     for key, base in [("/FH", "/Helvetica"), ("/FHB", "/Helvetica-Bold")]:
         if key not in font_dict:
             d = DictionaryObject()
-            d[NameObject("/Type")]     = NameObject("/Font")
-            d[NameObject("/Subtype")]  = NameObject("/Type1")
+            d[NameObject("/Type")] = NameObject("/Font")
+            d[NameObject("/Subtype")] = NameObject("/Type1")
             d[NameObject("/BaseFont")] = NameObject(base)
             font_dict[NameObject(key)] = d
 
 
 def get_content_object(page):
-    """Return the single content-stream object from a page."""
+    """Return the content stream object from a page."""
     ref = page.raw_get("/Contents")
     if isinstance(ref, ArrayObject):
         return ref[0].get_object()
     return ref.get_object()
 
 
+def find_block_by_position_and_font(stream_data: bytes, y_pos: float, font_size: float, 
+                                   font_num: str = None, x_range: tuple = None) -> tuple:
+    """
+    Find a BT...ET block by its Y position and font size.
+    Returns (start, end, block) or (None, None, None).
+    """
+    # Find all BT...ET blocks
+    bt_blocks = re.findall(rb'BT.*?ET', stream_data, re.DOTALL)
+    
+    for block in bt_blocks:
+        # Extract font info
+        font_match = re.search(rb'/F(\d+)\s+([\d.]+)\s+Tf', block)
+        # Extract position: 1 0 0.000000 -1 X Y Tm
+        tm_match = re.search(rb'1\s+0\s+[\d.]+\s+-1\s+([\d.]+)\s+([\d.]+)\s+Tm', block)
+        
+        if font_match and tm_match:
+            block_font_num = font_match.group(1).decode()
+            block_font_size = float(font_match.group(2))
+            block_x = float(tm_match.group(1))
+            block_y = float(tm_match.group(2))
+            
+            # Check if this matches our criteria
+            y_match = abs(block_y - y_pos) < 5  # Allow 5-point tolerance
+            size_match = abs(block_font_size - font_size) < 1
+            font_match_check = (font_num is None) or (block_font_num == font_num)
+            x_match = (x_range is None) or (x_range[0] <= block_x <= x_range[1])
+            
+            if y_match and size_match and font_match_check and x_match:
+                start = stream_data.find(block)
+                end = start + len(block)
+                return start, end, block
+    
+    return None, None, None
+
+
 def convert_pdf(input_bytes: bytes) -> bytes:
     """
-    Replace the 4 Yash Gallery fields directly in the PDF content stream
-    and return the modified PDF bytes.
+    Replace Yash Gallery fields with Aashirwad Garments fields.
+    This version finds blocks by their position and font characteristics.
     """
-    reader  = PdfReader(io.BytesIO(input_bytes))
-    page    = reader.pages[0]
-    obj     = get_content_object(page)
-    dec     = bytearray(obj.get_data())
+    reader = PdfReader(io.BytesIO(input_bytes))
+    page = reader.pages[0]
+    obj = get_content_object(page)
+    dec = obj.get_data()
 
-    # ── Build replacement blocks ──────────────────────────────────────────────
+    # Track replacements to apply in reverse order (to preserve byte positions)
+    replacements = []
 
-    # 1. Company name  (Block 0) — bold, size 21.28 stream / 15.96 pdf
-    sx0 = stream_x_centered("Aashirwad Garments", "Helvetica-Bold", 21.28 * SCALE)
-    b0  = make_bt_block(sx0, 47.68, "FHB", 21.28, "Aashirwad Garments")
+    # 1. Company name: Y~47.68, Font size 21.28, F1, centered
+    start, end, block = find_block_by_position_and_font(dec, 47.68, 21.28, font_num="1")
+    if start is not None and block is not None:
+        sx, sy = extract_position_from_bt_block(block)
+        font_key, font_size = extract_font_info_from_bt_block(block)
+        
+        if sx and sy and font_key and font_size:
+            new_sx = stream_x_centered("Aashirwad Garments", "Helvetica-Bold", font_size * SCALE)
+            new_block = make_bt_block(new_sx, sy, font_key, font_size, "Aashirwad Garments")
+            replacements.append((start, end, new_block))
 
-    # 2. Address  (Block 1) — regular, size 10.72 stream / 8.04 pdf
-    sx1 = stream_x_centered(
-        "Plot No - 22, Tantiyawas, Birij Vihar, Amber, Jaipur 303704",
-        "Helvetica", 10.72 * SCALE
+    # 2. Address: Y~68.16, Font size 10.72, F2, centered
+    start, end, block = find_block_by_position_and_font(dec, 68.16, 10.72, font_num="2")
+    if start is not None and block is not None:
+        sx, sy = extract_position_from_bt_block(block)
+        font_key, font_size = extract_font_info_from_bt_block(block)
+        
+        if sx and sy and font_key and font_size:
+            new_text = "Plot No - 22, Tantiyawas, Birij Vihar, Amber, Jaipur 303704"
+            new_sx = stream_x_centered(new_text, "Helvetica", font_size * SCALE)
+            new_block = make_bt_block(new_sx, sy, font_key, font_size, new_text)
+            replacements.append((start, end, new_block))
+
+    # 3. GSTIN: Y~83.04, Font size 10.72, F1, centered
+    start, end, block = find_block_by_position_and_font(dec, 83.04, 10.72, font_num="1")
+    if start is not None and block is not None:
+        sx, sy = extract_position_from_bt_block(block)
+        font_key, font_size = extract_font_info_from_bt_block(block)
+        
+        if sx and sy and font_key and font_size:
+            new_text = "GSTIN : 08ARNPK0658G1ZL"
+            new_sx = stream_x_centered(new_text, "Helvetica-Bold", font_size * SCALE)
+            new_block = make_bt_block(new_sx, sy, font_key, font_size, new_text)
+            replacements.append((start, end, new_block))
+
+    # 4. Signature: Y~457.76 (or nearby), Font size 10.72, F1, X > 550 (right-aligned)
+    start, end, block = find_block_by_position_and_font(
+        dec, 457.76, 10.72, font_num="1", x_range=(550, 650)
     )
-    b1  = make_bt_block(
-        sx1, 68.16, "FH", 10.72,
-        "Plot No - 22, Tantiyawas, Birij Vihar, Amber, Jaipur 303704"
-    )
+    if start is not None and block is not None:
+        sx, sy = extract_position_from_bt_block(block)
+        font_key, font_size = extract_font_info_from_bt_block(block)
+        
+        if sx and sy and font_key and font_size:
+            # Right-align: maintain the right edge position
+            orig_text = "For Yash Gallery Pvt Ltd"
+            new_text = "For Aashirwad Garments"
+            
+            orig_right = sx * SCALE + pdfmetrics.stringWidth(orig_text, "Helvetica-Bold", font_size * SCALE)
+            new_w = pdfmetrics.stringWidth(new_text, "Helvetica-Bold", font_size * SCALE)
+            new_sx = (orig_right - new_w) / SCALE
+            
+            new_block = make_bt_block(new_sx, sy, font_key, font_size, new_text)
+            replacements.append((start, end, new_block))
 
-    # 3. GSTIN  (Block 2) — bold, size 10.72 stream / 8.04 pdf
-    sx2 = stream_x_centered("GSTIN : 08ARNPK0658G1ZL", "Helvetica-Bold", 10.72 * SCALE)
-    b2  = make_bt_block(sx2, 83.04, "FHB", 10.72, "GSTIN : 08ARNPK0658G1ZL")
-
-    # 4. Signature line  (Block 61) — bold, right-aligned to original right edge
-    sx61 = stream_x_right_aligned(
-        "For Aashirwad Garments", "For Yash Gallery Pvt Ltd",
-        610.56, "Helvetica-Bold", 10.72 * SCALE
-    )
-    b61 = make_bt_block(sx61, 439.84, "FHB", 10.72, "For Aashirwad Garments")
-
-    # ── Splice into decompressed stream (reverse order keeps offsets valid) ───
-    replacements = [
-        (*BLOCK_RANGES["signature"], b61),
-        (*BLOCK_RANGES["gstin"],     b2),
-        (*BLOCK_RANGES["address"],   b1),
-        (*BLOCK_RANGES["company"],   b0),
-    ]
+    # Apply replacements in reverse order to preserve byte positions
+    replacements.sort(reverse=True, key=lambda x: x[0])
+    
     new_dec = bytearray(dec)
-    for start, end, block in replacements:          # already in reverse order
-        new_dec = new_dec[:start] + bytearray(block) + new_dec[end:]
+    for start, end, new_block in replacements:
+        new_dec = new_dec[:start] + bytearray(new_block) + new_dec[end:]
 
-    # ── Write back ────────────────────────────────────────────────────────────
-    obj._data         = zlib.compress(bytes(new_dec))
+    # Write back compressed data
+    obj._data = zlib.compress(bytes(new_dec))
     obj._decoded_self = None
 
     add_helvetica_fonts(page)
