@@ -1,8 +1,6 @@
 import streamlit as st
-import fitz  # PyMuPDF
 import io
-import os
-from pathlib import Path
+from pypdf import PdfReader, PdfWriter
 
 st.set_page_config(page_title="Aashirwad Garments - Challan Generator", layout="centered")
 
@@ -10,7 +8,6 @@ st.title("🧵 Aashirwad Garments")
 st.subheader("Challan PDF Converter")
 st.markdown("Upload a **Yash Gallery** job work challan PDF and download it rebranded as **Aashirwad Garments**.")
 
-# Replacements mapping
 REPLACEMENTS = {
     "Yash Gallery Pvt Ltd": "Aashirwad Garments",
     "55 TO 64, Tantiyawas, Birij Vihar, Amber, Jaipur 303704 Rajasthan (08)": "Plot No - 22, Tantiyawas, Birij Vihar, Amber, Jaipur 303704",
@@ -22,83 +19,49 @@ REPLACEMENTS = {
 }
 
 
+def replace_in_stream(data: bytes) -> bytes:
+    for old, new in REPLACEMENTS.items():
+        for encoding in ["latin-1", "utf-8", "cp1252"]:
+            try:
+                old_bytes = old.encode(encoding)
+                new_bytes = new.encode(encoding)
+                data = data.replace(old_bytes, new_bytes)
+            except Exception:
+                pass
+    return data
+
+
 def replace_text_in_pdf(input_bytes: bytes) -> bytes:
-    """Replace text in PDF using PyMuPDF redaction."""
-    doc = fitz.open(stream=input_bytes, filetype="pdf")
+    reader = PdfReader(io.BytesIO(input_bytes))
+    writer = PdfWriter()
 
-    for page in doc:
-        for old_text, new_text in REPLACEMENTS.items():
-            # Search for text instances (case-sensitive)
-            instances = page.search_for(old_text)
-            for inst in instances:
-                # Add redaction annotation to cover old text
-                page.add_redact_annot(inst, fill=(1, 1, 1))  # white fill
+    for page in reader.pages:
+        if "/Contents" in page:
+            contents = page["/Contents"]
 
-            page.apply_redactions()
+            # Single stream object
+            if hasattr(contents, "get_data"):
+                raw = contents.get_data()
+                contents._data = replace_in_stream(raw)
+                contents._decoded_self = None
 
-            # Now re-insert new text at the same locations
-            instances = page.search_for(old_text)
-            # Search again after redaction (won't find old text, so we track separately)
+            # Array of stream objects
+            else:
+                try:
+                    for item in contents:
+                        obj = item.get_object()
+                        if hasattr(obj, "get_data"):
+                            raw = obj.get_data()
+                            obj._data = replace_in_stream(raw)
+                            obj._decoded_self = None
+                except Exception:
+                    pass
 
-        # Do a second pass: search & redact & re-write
-        # We need to track positions before redacting, so restart with fresh approach
+        writer.add_page(page)
 
-    doc.close()
-
-    # --- Better approach: search → record rects → redact → insert new text ---
-    doc = fitz.open(stream=input_bytes, filetype="pdf")
-
-    for page in doc:
-        replacements_to_do = []
-
-        for old_text, new_text in REPLACEMENTS.items():
-            instances = page.search_for(old_text)
-            for rect in instances:
-                replacements_to_do.append((rect, old_text, new_text))
-
-        # Apply redactions first
-        for rect, old_text, new_text in replacements_to_do:
-            page.add_redact_annot(rect, fill=(1, 1, 1))
-
-        page.apply_redactions()
-
-        # Now insert new text at recorded positions
-        for rect, old_text, new_text in replacements_to_do:
-            # Get font size by checking surrounding text blocks
-            font_size = 9  # default
-
-            # Try to detect font size from nearby text
-            blocks = page.get_text("dict")["blocks"]
-            min_dist = float("inf")
-            for block in blocks:
-                if block["type"] == 0:
-                    for line in block["lines"]:
-                        for span in line["spans"]:
-                            span_rect = fitz.Rect(span["bbox"])
-                            dist = abs(span_rect.y0 - rect.y0)
-                            if dist < min_dist:
-                                min_dist = dist
-                                font_size = span["size"]
-
-            # Bold for title (company name)
-            font = "helv"
-            if old_text in ["Yash Gallery Pvt Ltd", "For Yash Gallery Pvt Ltd"]:
-                font = "hebo"  # Helvetica Bold
-                if old_text == "Yash Gallery Pvt Ltd":
-                    font_size = max(font_size, 14)
-
-            page.insert_text(
-                (rect.x0, rect.y1 - 1),
-                new_text,
-                fontsize=font_size,
-                fontname=font,
-                color=(0, 0, 0),
-            )
-
-    output_buffer = io.BytesIO()
-    doc.save(output_buffer)
-    doc.close()
-    return output_buffer.getvalue()
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
 
 
 uploaded_file = st.file_uploader("📂 Upload Yash Gallery Challan PDF", type=["pdf"])
@@ -112,7 +75,6 @@ if uploaded_file is not None:
             output_bytes = replace_text_in_pdf(input_bytes)
             st.success("🎉 PDF successfully converted!")
 
-            # Preview info
             st.markdown("### Changes Applied:")
             st.markdown("""
 | Original | Replaced With |
@@ -123,7 +85,6 @@ if uploaded_file is not None:
 | For Yash Gallery Pvt Ltd | For Aashirwad Garments |
 """)
 
-            # Download button
             output_filename = uploaded_file.name.replace(".pdf", "_aashirwad.pdf")
             st.download_button(
                 label="⬇️ Download Converted PDF",
