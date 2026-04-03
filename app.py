@@ -1,14 +1,9 @@
 import streamlit as st
 import io
-import zlib
+import pdfplumber
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import (
-    ArrayObject, NameObject, DictionaryObject,
-    DecodedStreamObject, EncodedStreamObject
-)
+from pypdf.generic import ArrayObject, NameObject, DictionaryObject
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.pdfmetrics import registerFont
-from reportlab.pdfbase.ttfonts import TTFont
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Aashirwad Garments - Challan Converter", layout="centered")
@@ -21,227 +16,234 @@ st.markdown(
     "everything else stays exactly the same."
 )
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-def p2s(v):
-    """Convert pdfplumber coordinate to stream coordinate."""
-    return v / 0.75
+# ── New values ────────────────────────────────────────────────────────────────
+NEW_COMPANY = "Aashirwad Garments"
+NEW_ADDRESS = "Plot No - 22, Tantiyawas, Birij Vihar, Amber, Jaipur 303704"
+NEW_GSTIN   = "GSTIN : 08ARNPK0658G1ZL"
+NEW_SIG     = "For Aashirwad Garments"
+
+# Strings to search for in the old PDF (partial match)
+SEARCH_COMPANY = "Yash Gallery"
+SEARCH_ADDRESS = "Tantiyawas"
+SEARCH_GSTIN   = "08AABCY3804E1ZJ"
+SEARCH_SIG     = "For Yash Gallery"
 
 
-# ── Core helpers ──────────────────────────────────────────────────────────────
+# ── pdfplumber helpers ────────────────────────────────────────────────────────
+
+def find_line_bbox(words, search: str, y_tol: float = 3.0):
+    """
+    Find the first word containing `search`, then collect all words on
+    the same horizontal line (within y_tol pts). Returns merged bbox
+    (x0, top, x1, bottom) in pdfplumber coordinates, or None.
+    """
+    search_lo = search.lower()
+    anchor = next((w for w in words if search_lo in w["text"].lower()), None)
+    if anchor is None:
+        return None
+    line = [w for w in words if abs(w["top"] - anchor["top"]) <= y_tol]
+    return (
+        min(w["x0"]     for w in line),
+        min(w["top"]    for w in line),
+        max(w["x1"]     for w in line),
+        max(w["bottom"] for w in line),
+    )
+
+
+# ── pypdf helpers ─────────────────────────────────────────────────────────────
 
 def add_fonts_to_page(page) -> None:
-    """Add Helvetica and Helvetica-Bold as /FHR and /FHB to page resources."""
     if "/Resources" not in page:
         page[NameObject("/Resources")] = DictionaryObject()
-
-    resources = page["/Resources"]
-
-    # Get or create the font dictionary
-    if "/Font" not in resources:
-        resources[NameObject("/Font")] = DictionaryObject()
-
-    font_dict = resources["/Font"]
-
+    res = page["/Resources"]
+    if "/Font" not in res:
+        res[NameObject("/Font")] = DictionaryObject()
+    fd = res["/Font"]
     for key, base in [("/FHB", "/Helvetica-Bold"), ("/FHR", "/Helvetica")]:
-        if NameObject(key) not in font_dict:
+        if NameObject(key) not in fd:
             d = DictionaryObject()
             d[NameObject("/Type")]     = NameObject("/Font")
             d[NameObject("/Subtype")]  = NameObject("/Type1")
             d[NameObject("/BaseFont")] = NameObject(base)
             d[NameObject("/Encoding")] = NameObject("/WinAnsiEncoding")
-            font_dict[NameObject(key)] = d
+            fd[NameObject(key)] = d
 
 
 def get_raw_content(page) -> bytes:
-    """Decode and return the full content stream bytes from a page."""
-    contents = page.get("/Contents")
-    if contents is None:
+    c = page.get("/Contents")
+    if c is None:
         return b""
+    c = c.get_object()
+    if isinstance(c, ArrayObject):
+        return b"\n".join(item.get_object().get_data() for item in c)
+    return c.get_data()
 
-    # Resolve if it's an indirect reference
-    contents = contents.get_object()
 
-    if isinstance(contents, ArrayObject):
-        # Multiple content streams — concatenate all
-        parts = []
-        for item in contents:
-            obj = item.get_object()
-            parts.append(obj.get_data())
-        return b"\n".join(parts)
+def set_page_content(page, data: bytes) -> None:
+    c = page["/Contents"]
+    if isinstance(c, ArrayObject):
+        first = c[0].get_object()
+        first.set_data(data)
+        page[NameObject("/Contents")] = c[0]
     else:
-        return contents.get_data()
+        c.get_object().set_data(data)
 
 
-def set_page_content(page, new_data: bytes) -> None:
-    """
-    Replace the page's content stream with new_data.
-    Works whether /Contents is a single object or an array.
-    """
-    contents = page.raw_get("/Contents")
-    contents_obj = page["/Contents"]
+# ── PDF drawing primitives ────────────────────────────────────────────────────
 
-    if isinstance(contents_obj, ArrayObject):
-        # Collapse all streams into the first one, discard the rest
-        first_obj = contents_obj[0].get_object()
-        first_obj.set_data(new_data)
-        # Replace array with single reference
-        page[NameObject("/Contents")] = contents_obj[0]
-    else:
-        contents_obj = contents_obj.get_object()
-        contents_obj.set_data(new_data)
+def white_rect(sx, sy, sw, sh) -> bytes:
+    return (f"q\n1 1 1 rg\n{sx:.4f} {sy:.4f} {sw:.4f} {sh:.4f} re\nf\nQ\n").encode()
 
 
-def bt_block(sx: float, sy: float, font_key: str,
-             font_size: float, text: str) -> bytes:
-    """
-    Emit a BT…ET text block in stream coordinates.
-    sx, sy are stream-space coordinates (pdfplumber_coord / 0.75).
-    sy should be the BOTTOM of the text (pdfplumber 'bottom' value / 0.75).
-    The text matrix uses -1 y-scale to match the CTM flip.
-    """
-    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+def bt_block(sx, sy, font_key, font_size, text) -> bytes:
+    esc = text.replace("\\","\\\\").replace("(","\\(").replace(")","\\)")
     return (
-        f"q\n"
-        f"0 0 0 rg\n"
-        f"BT\n"
-        f"/{font_key} {font_size:.4f} Tf\n"
-        f"1 0 0.000000 -1 {sx:.4f} {sy:.4f} Tm\n"
-        f"({escaped}) Tj\n"
-        f"ET\n"
-        f"Q\n"
+        f"q\n0 0 0 rg\n"
+        f"BT\n/{font_key} {font_size:.4f} Tf\n"
+        f"1 0 0 -1 {sx:.4f} {sy:.4f} Tm\n"
+        f"({esc}) Tj\nET\nQ\n"
     ).encode("latin-1")
 
 
-def centered_sx(text: str, font: str, font_size: float,
-                page_stream_width: float = 793.76) -> float:
-    """Return stream-space x so that text is horizontally centred."""
-    w = pdfmetrics.stringWidth(text, font, font_size)
-    return (page_stream_width - w) / 2
+def centered_sx(text, font_name, font_size, stream_width) -> float:
+    w = pdfmetrics.stringWidth(text, font_name, font_size)
+    return (stream_width - w) / 2
 
 
-def make_overlay() -> bytes:
-    """
-    Build a PDF content snippet that:
-      1. Paints a white rectangle over the header area (covers old company text).
-      2. Draws the Aashirwad Garments header text.
-      3. Whites-out the old signature and writes the new one.
-    """
-    # ── 1. White rectangle covering header (pdfplumber top=0 to 83) ──────────
-    white_header = b"q\n1 1 1 rg\n0 0 793.76 110.67 re\nf\nQ\n"
-
-    # ── 2. New company header text ────────────────────────────────────────────
-    font_bold = 21.28
-    font_reg  = 8.0
-    company    = "Aashirwad Garments"
-    address    = "Plot No - 22, Tantiyawas, Birij Vihar, Amber, Jaipur 303704"
-    gstin_text = "GSTIN : 08ARNPK0658G1ZL"
-    sig_text   = "For Aashirwad Garments"
-
-    cx_company = centered_sx(company,    "Helvetica-Bold", font_bold)
-    cx_address = centered_sx(address,    "Helvetica",      font_reg)
-    cx_gstin   = centered_sx(gstin_text, "Helvetica-Bold", font_reg)
-
-    # Signature: right-align to match original
-    sig_w = pdfmetrics.stringWidth(sig_text, "Helvetica-Bold", font_reg)
-    x_sig = p2s(566.7) - sig_w
-
-    # ── 3. White rectangle over signature area ────────────────────────────────
-    sig_sy_top = p2s(340)
-    sig_height = p2s(358) - sig_sy_top
-    white_sig = (
-        f"q\n1 1 1 rg\n"
-        f"{p2s(440):.2f} {sig_sy_top:.2f} {p2s(595-440):.2f} {sig_height+4:.2f} re\n"
-        f"f\nQ\n"
-    ).encode()
-
-    parts = [
-        white_header,
-        bt_block(cx_company, p2s(39.1), "FHB", font_bold, company),
-        bt_block(cx_address, p2s(52.8), "FHR", font_reg,  address),
-        bt_block(cx_gstin,   p2s(64.0), "FHB", font_reg,  gstin_text),
-        white_sig,
-        bt_block(x_sig, p2s(352.6), "FHB", font_reg, sig_text),
-    ]
-    return b"\n".join(parts)
-
-
-# ── Main conversion function ───────────────────────────────────────────────────
+# ── Main conversion ───────────────────────────────────────────────────────────
 
 def convert_pdf(input_bytes: bytes) -> bytes:
-    """
-    Replace Yash Gallery header / signature with Aashirwad Garments.
-    Uses PdfWriter.clone_reader_document_root for proper indirect object handling.
-    """
-    reader = PdfReader(io.BytesIO(input_bytes))
+
+    # ── 1. Use pdfplumber to DETECT real positions of old text ────────────────
+    with pdfplumber.open(io.BytesIO(input_bytes)) as pdf:
+        pl  = pdf.pages[0]
+        words = pl.extract_words()
+
+        pl_width  = float(pl.width)
+        pl_height = float(pl.height)
+
+        bbox_company = find_line_bbox(words, SEARCH_COMPANY)
+        bbox_address = find_line_bbox(words, SEARCH_ADDRESS)
+        bbox_gstin   = find_line_bbox(words, SEARCH_GSTIN)
+        bbox_sig     = find_line_bbox(words, SEARCH_SIG)
+
+    # ── 2. Detect scale: pdfplumber pt width vs pypdf MediaBox width ──────────
+    reader  = PdfReader(io.BytesIO(input_bytes))
+    mb      = reader.pages[0].mediabox
+    pdf_w   = float(mb.width)   # raw PDF units (e.g. 595.32 for A4)
+    # pdfplumber always reports in pts; if CTM scales by 0.75 the raw pdf_w
+    # will be ~793.76 (=595/0.75). Derive scale = pl_width / pdf_w ... but
+    # pdfplumber already accounts for rotation/CTM so pl_width == pdf_w in pts.
+    # The content stream however uses a CTM that may scale coords.
+    # We detect by comparing pl_width (pts) to the raw stream space width.
+    # Common case: CTM is `0.75 0 0 -0.75 0 H cm` → stream_width = pl_w/0.75
+    # We infer scale from the fact stream_width * scale = pl_width.
+    # Default assumption: scale = 0.75 (covers most Yash Gallery PDFs).
+    scale = 0.75
+    stream_width = pl_width / scale   # e.g. 793.76
+
+    PAD = 3.0  # padding in pdfplumber pts around each white box
+
+    parts = []
+
+    # ── 3. White-out + redraw header ──────────────────────────────────────────
+    header_bboxes = [b for b in [bbox_company, bbox_address, bbox_gstin] if b]
+    if header_bboxes:
+        # One big white rectangle covering entire header zone
+        zone_top    = min(b[1] for b in header_bboxes) - PAD
+        zone_bottom = max(b[3] for b in header_bboxes) + PAD
+        # In stream space: origin top-left, y increases downward (after CTM flip)
+        parts.append(white_rect(
+            0,
+            zone_top / scale,
+            stream_width,
+            (zone_bottom - zone_top) / scale
+        ))
+
+        font_bold = 14.0
+        font_reg  =  8.0
+
+        # Company — centred, bold, large; baseline = old company bottom
+        if bbox_company:
+            sy = bbox_company[3] / scale
+            sx = centered_sx(NEW_COMPANY, "Helvetica-Bold", font_bold, stream_width)
+            parts.append(bt_block(sx, sy, "FHB", font_bold, NEW_COMPANY))
+
+        # Address — centred, regular, small; baseline = old address bottom
+        if bbox_address:
+            sy = bbox_address[3] / scale
+            sx = centered_sx(NEW_ADDRESS, "Helvetica", font_reg, stream_width)
+            parts.append(bt_block(sx, sy, "FHR", font_reg, NEW_ADDRESS))
+
+        # GSTIN — centred, bold, small; baseline = old GSTIN bottom
+        if bbox_gstin:
+            sy = bbox_gstin[3] / scale
+            sx = centered_sx(NEW_GSTIN, "Helvetica-Bold", font_reg, stream_width)
+            parts.append(bt_block(sx, sy, "FHB", font_reg, NEW_GSTIN))
+
+    # ── 4. White-out + redraw signature line ──────────────────────────────────
+    if bbox_sig:
+        x0, top, x1, bottom = bbox_sig
+        # White box exactly over old signature
+        parts.append(white_rect(
+            (x0 - PAD) / scale,
+            (top - PAD) / scale,
+            (x1 - x0 + 2 * PAD) / scale,
+            (bottom - top + 2 * PAD) / scale,
+        ))
+        # New sig: right-aligned to same right edge as old text
+        font_reg = 8.0
+        tw  = pdfmetrics.stringWidth(NEW_SIG, "Helvetica-Bold", font_reg)
+        tsx = x1 / scale - tw          # right edge preserved
+        tsy = bottom / scale           # baseline preserved
+        parts.append(bt_block(tsx, tsy, "FHB", font_reg, NEW_SIG))
+
+    overlay = b"\n".join(parts)
+
+    # ── 5. Apply overlay with pypdf ───────────────────────────────────────────
     writer = PdfWriter()
-
-    # Clone the entire document so indirect references remain valid
     writer.clone_reader_document_root(reader)
-
     page = writer.pages[0]
-
-    # 1. Register new fonts on the writer's page
     add_fonts_to_page(page)
+    orig = get_raw_content(page)
+    set_page_content(page, orig + b"\n" + overlay)
 
-    # 2. Read the original content
-    orig_data = get_raw_content(page)
-
-    # 3. Build overlay and combine
-    overlay  = make_overlay()
-    combined = orig_data + b"\n" + overlay
-
-    # 4. Write back using set_data (the correct pypdf API)
-    set_page_content(page, combined)
-
-    # 5. Output
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue()
 
 
-# ── Streamlit UI ───────────────────────────────────────────────────────────────
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
 
 uploaded = st.file_uploader("📂 Upload Yash Gallery Challan PDF", type=["pdf"])
 
 if uploaded:
     st.success(f"✅ Uploaded: **{uploaded.name}**")
-
     with st.spinner("Converting…"):
         try:
             output_bytes = convert_pdf(uploaded.read())
-            st.success("🎉 PDF converted successfully!")
+            st.success("🎉 Converted successfully!")
 
             st.markdown("### Changes made:")
             st.table({
-                "Field": ["Company Name", "Address", "GSTIN", "Signature Line"],
-                "Original": [
+                "Field":         ["Company Name", "Address", "GSTIN", "Signature"],
+                "Original":      [
                     "Yash Gallery Pvt Ltd",
                     "55 TO 64, Tantiyawas, Birij Vihar, Amber, Jaipur 303704 Rajasthan (08)",
                     "GSTIN : 08AABCY3804E1ZJ",
                     "For Yash Gallery Pvt Ltd",
                 ],
-                "Replaced With": [
-                    "Aashirwad Garments",
-                    "Plot No - 22, Tantiyawas, Birij Vihar, Amber, Jaipur 303704",
-                    "GSTIN : 08ARNPK0658G1ZL",
-                    "For Aashirwad Garments",
-                ],
+                "Replaced With": [NEW_COMPANY, NEW_ADDRESS, NEW_GSTIN, NEW_SIG],
             })
 
             out_name = uploaded.name.replace(".pdf", "_Aashirwad.pdf")
-            st.download_button(
-                label="⬇️ Download Converted PDF",
-                data=output_bytes,
-                file_name=out_name,
-                mime="application/pdf",
-            )
-
+            st.download_button("⬇️ Download Converted PDF",
+                               data=output_bytes,
+                               file_name=out_name,
+                               mime="application/pdf")
         except Exception as e:
             st.error(f"❌ Error: {e}")
             st.exception(e)
 
 st.markdown("---")
-st.caption(
-    "Aashirwad Garments | Plot No - 22, Tantiyawas, Birij Vihar, Amber, Jaipur 303704 "
-    "| GSTIN : 08ARNPK0658G1ZL"
-)
+st.caption("Aashirwad Garments | Plot No - 22, Tantiyawas, Birij Vihar, Amber, Jaipur 303704 | GSTIN : 08ARNPK0658G1ZL")
