@@ -76,8 +76,9 @@ def make_overlay(stream_data: bytes) -> bytes:
     The original stream uses the CTM:  0.75 0 0 -0.75 0 841.92 cm
     so all positions here are in *stream* space (stream_y increases downward).
     """
-    # ── 1. White rectangle covering the header (stream y 30 → 115) ──────────
-    white_header = b"1 1 1 rg\n0 30 794 86 re\nf\n"
+    # ── 1. White rectangle covering the header (stream y 30 → 120) ──────────
+    # Extended slightly to ensure complete coverage
+    white_header = b"1 1 1 rg\n0 28 794 92 re\nf\n"
 
     # ── 2. Company name (stream y 47.68, bold 21.28 pt) ────────────────────
     font_bold  = 21.28
@@ -95,15 +96,21 @@ def make_overlay(stream_data: bytes) -> bytes:
     sig_w = pdfmetrics.stringWidth(sig_text, "Helvetica-Bold", font_reg)
     x_sig = 750 - sig_w
 
-    # ── 3. White rectangle over signature line (stream y ≈ 450–464) ─────────
-    white_sig = b"1 1 1 rg\n590 450 200 14 re\nf\n"
+    # ── 3. White rectangles over signature area ─────────────────────────────
+    # Using two rectangles to ensure complete coverage:
+    # First rectangle: covers "For Yash Gallery Pvt Ltd" (main signature line)
+    white_sig_1 = b"1 1 1 rg\n540 446 255 24 re\nf\n"
+    
+    # Second rectangle: covers "(Authorised Signatory)" line below
+    white_sig_2 = b"1 1 1 rg\n600 467 195 18 re\nf\n"
 
     parts = [
         white_header,
         bt_block(cx_company, 47.68,  "FHB", font_bold, company),
         bt_block(cx_address, 68.16,  "FHR", font_reg,  address),
         bt_block(cx_gstin,   83.04,  "FHB", font_reg,  gstin_text),
-        white_sig,
+        white_sig_1,
+        white_sig_2,
         bt_block(x_sig,      457.76, "FHB", font_reg,  sig_text),
     ]
     return b"".join(parts)
