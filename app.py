@@ -17,29 +17,10 @@ st.markdown(
     "everything else stays exactly the same."
 )
 
-# ── Configuration Constants ───────────────────────────────────────────────────
-# Adjust these if positioning needs fine-tuning
+# ── Constants ─────────────────────────────────────────────────────────────────
 SCALE      = 0.75
 PAGE_W_PDF = 595.32001
 STREAM_W   = PAGE_W_PDF / SCALE   # stream-space page width (~793.8)
-
-# Header text positions (Y coordinates in stream space)
-COMPANY_Y = 47.68
-ADDRESS_Y = 68.16
-GSTIN_Y   = 83.04
-
-# White rectangle coordinates for header (x, y, width, height)
-# Format: x=left edge, y=top edge, width, height (all in stream coordinates)
-HEADER_RECT_1 = (150, 42, 494, 18)   # Company name area
-HEADER_RECT_2 = (80, 62, 634, 14)    # Address area
-HEADER_RECT_3 = (280, 79, 234, 12)   # GSTIN area
-
-# Signature positioning
-SIG_Y = 457.76              # Y position for signature text
-SIG_RIGHT_MARGIN = 750      # Right edge for signature alignment
-
-# White rectangle for signature (x, y, width, height)
-SIG_RECT = (540, 452, 155, 14)  # Covers "For Yash Gallery Pvt Ltd"
 
 # ── Core helpers ─────────────────────────────────────────────────────────────
 
@@ -78,11 +59,6 @@ def bt_block(x: float, y: float, font_key: str,
     ).encode("latin-1")
 
 
-def white_rect(x: float, y: float, w: float, h: float) -> bytes:
-    """Create a white rectangle at specified coordinates."""
-    return f"1 1 1 rg\n{x:.2f} {y:.2f} {w:.2f} {h:.2f} re\nf\n".encode("latin-1")
-
-
 def centered_x(text: str, font: str, font_size: float) -> float:
     """Return stream-space x so that text is horizontally centred."""
     w = pdfmetrics.stringWidth(text, font, font_size)
@@ -91,49 +67,52 @@ def centered_x(text: str, font: str, font_size: float) -> float:
 
 def make_overlay(stream_data: bytes) -> bytes:
     """
-    Build a PDF content snippet that overlays new company details.
-    
-    Strategy:
-      1. Paint small white rectangles over ONLY the text that needs replacing
-      2. Draw new text in the correct positions
-      3. Preserve all borders, lines, and document structure
-    
-    All coordinates are in stream space (CTM: 0.75 0 0 -0.75 0 841.92 cm)
+    Build a PDF content snippet (in the original stream's coordinate space)
+    that:
+      1. Paints a white rectangle over the header area.
+      2. Draws the Aashirwad Garments header text.
+      3. Whites-out the old signature and writes the new one.
+
+    The original stream uses the CTM:  0.75 0 0 -0.75 0 841.92 cm
+    so all positions here are in *stream* space (stream_y increases downward).
     """
-    # Font sizes
-    font_bold  = 21.28  # Company name
-    font_reg   = 10.72  # Address, GSTIN, signature
-    
-    # New company details
+    # ── 1. White rectangle covering the header (stream y 30 → 120) ──────────
+    # Extended slightly to ensure complete coverage
+    white_header = b"1 1 1 rg\n0 28 794 92 re\nf\n"
+
+    # ── 2. Company name (stream y 47.68, bold 21.28 pt) ────────────────────
+    font_bold  = 21.28
+    font_reg   = 10.72
     company    = "Aashirwad Garments"
     address    = "Plot No - 22, Tantiyawas, Birij Vihar, Amber, Jaipur 303704"
     gstin_text = "GSTIN : 08ARNPK0658G1ZL"
     sig_text   = "For Aashirwad Garments"
 
-    # Calculate centered X positions
     cx_company = centered_x(company,    "Helvetica-Bold", font_bold)
     cx_address = centered_x(address,    "Helvetica",      font_reg)
     cx_gstin   = centered_x(gstin_text, "Helvetica-Bold", font_reg)
 
-    # Calculate signature X position (right-aligned)
+    # Signature: right-align to stream x ≈ 750
     sig_w = pdfmetrics.stringWidth(sig_text, "Helvetica-Bold", font_reg)
-    x_sig = SIG_RIGHT_MARGIN - sig_w
+    x_sig = 750 - sig_w
 
-    # Build the overlay
-    parts = [
-        # White rectangles over old text
-        white_rect(*HEADER_RECT_1),  # Company name
-        white_rect(*HEADER_RECT_2),  # Address
-        white_rect(*HEADER_RECT_3),  # GSTIN
-        white_rect(*SIG_RECT),       # Signature
-        
-        # New text
-        bt_block(cx_company, COMPANY_Y, "FHB", font_bold, company),
-        bt_block(cx_address, ADDRESS_Y, "FHR", font_reg,  address),
-        bt_block(cx_gstin,   GSTIN_Y,   "FHB", font_reg,  gstin_text),
-        bt_block(x_sig,      SIG_Y,     "FHB", font_reg,  sig_text),
-    ]
+    # ── 3. White rectangles over signature area ─────────────────────────────
+    # Using two rectangles to ensure complete coverage:
+    # First rectangle: covers "For Yash Gallery Pvt Ltd" (main signature line)
+    white_sig_1 = b"1 1 1 rg\n540 446 255 24 re\nf\n"
     
+    # Second rectangle: covers "(Authorised Signatory)" line below
+    white_sig_2 = b"1 1 1 rg\n600 467 195 18 re\nf\n"
+
+    parts = [
+        white_header,
+        bt_block(cx_company, 47.68,  "FHB", font_bold, company),
+        bt_block(cx_address, 68.16,  "FHR", font_reg,  address),
+        bt_block(cx_gstin,   83.04,  "FHB", font_reg,  gstin_text),
+        white_sig_1,
+        white_sig_2,
+        bt_block(x_sig,      457.76, "FHB", font_reg,  sig_text),
+    ]
     return b"".join(parts)
 
 
@@ -142,19 +121,21 @@ def make_overlay(stream_data: bytes) -> bytes:
 def convert_pdf(input_bytes: bytes) -> bytes:
     """
     Replace Yash Gallery header / signature with Aashirwad Garments.
-    
-    This function:
-      1. Registers Helvetica fonts
-      2. Appends an overlay to the existing content stream
-      3. Compresses and returns the modified PDF
+
+    Strategy:
+      • Keep the original content stream completely intact.
+      • Append a small overlay snippet that paints white boxes over the
+        old text and draws the new text — all in the same coordinate space
+        as the original stream, so no transform arithmetic is needed.
+      • Register Helvetica / Helvetica-Bold as new font resources (/FHB, /FHR).
     """
     reader = PdfReader(io.BytesIO(input_bytes))
     page   = reader.pages[0]
 
-    # 1. Register fonts
+    # 1. Register new fonts
     add_fonts_to_page(page)
 
-    # 2. Get original content stream
+    # 2. Fetch original content stream
     obj        = get_content_object(page)
     orig_data  = obj.get_data()
 
@@ -162,11 +143,11 @@ def convert_pdf(input_bytes: bytes) -> bytes:
     overlay    = make_overlay(orig_data)
     combined   = orig_data + b"\n" + overlay
 
-    # 4. Compress and update
+    # 4. Write back (compressed)
     obj._data         = zlib.compress(combined)
     obj._decoded_self = None
 
-    # 5. Write output
+    # 5. Output
     writer = PdfWriter()
     writer.add_page(page)
     out = io.BytesIO()
@@ -214,28 +195,6 @@ if uploaded:
         except Exception as e:
             st.error(f"❌ Error: {e}")
             st.exception(e)
-
-# ── Adjustment Instructions ──────────────────────────────────────────────────
-with st.expander("🔧 Need to adjust positioning?"):
-    st.markdown("""
-    If the text or borders aren't aligned perfectly, you can adjust the 
-    coordinates at the top of the code:
-    
-    **Header positioning:**
-    - `COMPANY_Y`, `ADDRESS_Y`, `GSTIN_Y` - Y positions for text
-    - `HEADER_RECT_1/2/3` - White rectangles (x, y, width, height)
-    
-    **Signature positioning:**
-    - `SIG_Y` - Y position for signature text
-    - `SIG_RIGHT_MARGIN` - Right edge alignment
-    - `SIG_RECT` - White rectangle dimensions
-    
-    **Tips:**
-    - Increase Y values to move text DOWN
-    - Decrease Y values to move text UP
-    - Adjust rectangle width/height to cover more/less area
-    - Keep changes small (try ±2 to ±5 points at a time)
-    """)
 
 st.markdown("---")
 st.caption(
