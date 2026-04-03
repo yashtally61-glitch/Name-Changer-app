@@ -4,7 +4,6 @@ import zlib
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ArrayObject, NameObject, DictionaryObject
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Aashirwad Garments - Challan Converter", layout="centered")
@@ -18,9 +17,13 @@ st.markdown(
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-SCALE      = 0.75
-PAGE_W_PDF = 595.32001
-STREAM_W   = PAGE_W_PDF / SCALE   # stream-space page width (~793.8)
+# The original PDF stream uses CTM: 0.75 0 0 -0.75 0 841.92 cm
+# After this transform: stream space has origin top-left, y increases downward
+# pdfplumber coordinates / 0.75 = stream coordinates
+
+def p2s(v):
+    """Convert pdfplumber coordinate to stream coordinate."""
+    return v / 0.75
 
 # ── Core helpers ─────────────────────────────────────────────────────────────
 
@@ -47,73 +50,89 @@ def get_content_object(page):
     return ref.get_object()
 
 
-def bt_block(x: float, y: float, font_key: str,
+def bt_block(sx: float, sy: float, font_key: str,
              font_size: float, text: str) -> bytes:
-    """Emit a simple BT…ET text block in stream coordinates."""
+    """
+    Emit a BT…ET text block in stream coordinates.
+    sx, sy are stream-space coordinates (pdfplumber_coord / 0.75).
+    sy should be the BOTTOM of the text (pdfplumber 'bottom' value / 0.75).
+    The text matrix uses -1 y-scale to match the CTM flip.
+    """
     escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
     return (
-        f"0 0 0 rg\n"
+        f"q\n0 0 0 rg\n"
         f"BT\n/{font_key} {font_size:.4f} Tf\n"
-        f"1 0 0.000000 -1 {x:.4f} {y:.4f} Tm\n"
-        f"({escaped}) Tj\nET\n"
+        f"1 0 0.000000 -1 {sx:.4f} {sy:.4f} Tm\n"
+        f"({escaped}) Tj\nET\nQ\n"
     ).encode("latin-1")
 
 
-def centered_x(text: str, font: str, font_size: float) -> float:
+def centered_sx(text: str, font: str, font_size: float,
+                page_stream_width: float = 793.76) -> float:
     """Return stream-space x so that text is horizontally centred."""
     w = pdfmetrics.stringWidth(text, font, font_size)
-    return (STREAM_W - w) / 2
+    return (page_stream_width - w) / 2
 
 
-def make_overlay(stream_data: bytes) -> bytes:
+def make_overlay(orig_data: bytes) -> bytes:
     """
-    Build a PDF content snippet (in the original stream's coordinate space)
-    that:
-      1. Paints a white rectangle over the header area.
+    Build a PDF content snippet that:
+      1. Paints a white rectangle over the header area (covers old company text).
       2. Draws the Aashirwad Garments header text.
       3. Whites-out the old signature and writes the new one.
 
-    The original stream uses the CTM:  0.75 0 0 -0.75 0 841.92 cm
-    so all positions here are in *stream* space (stream_y increases downward).
-    """
-    # ── 1. White rectangle covering the header (stream y 30 → 120) ──────────
-    # Extended slightly to ensure complete coverage
-    white_header = b"1 1 1 rg\n0 28 794 92 re\nf\n"
+    All coordinates are in stream space (pdfplumber_coord / 0.75).
+    The stream uses CTM: 0.75 0 0 -0.75 0 841.92 cm
+    so stream space: origin top-left, y increases downward.
 
-    # ── 2. Company name (stream y 47.68, bold 21.28 pt) ────────────────────
-    font_bold  = 21.28
-    font_reg   = 10.72
+    Key: this overlay is APPENDED to the original stream, so it renders AFTER
+    the original content. White rectangles cover the old text, then new text
+    is drawn on top — correct visual layering.
+    """
+    # ── 1. White rectangle covering header (pdfplumber top=0 to 83) ─────────
+    # Stream rect: lower-left=(0,0), width=793.76, height=p2s(83)=110.67
+    white_header = b"q\n1 1 1 rg\n0 0 793.76 110.67 re\nf\nQ\n"
+
+    # ── 2. New company header text ───────────────────────────────────────────
+    font_bold = 21.28
+    font_reg  = 8.0
     company    = "Aashirwad Garments"
     address    = "Plot No - 22, Tantiyawas, Birij Vihar, Amber, Jaipur 303704"
     gstin_text = "GSTIN : 08ARNPK0658G1ZL"
     sig_text   = "For Aashirwad Garments"
 
-    cx_company = centered_x(company,    "Helvetica-Bold", font_bold)
-    cx_address = centered_x(address,    "Helvetica",      font_reg)
-    cx_gstin   = centered_x(gstin_text, "Helvetica-Bold", font_reg)
+    cx_company = centered_sx(company,    "Helvetica-Bold", font_bold)
+    cx_address = centered_sx(address,    "Helvetica",      font_reg)
+    cx_gstin   = centered_sx(gstin_text, "Helvetica-Bold", font_reg)
 
-    # Signature: right-align to stream x ≈ 750
+    # Signature: right-align to match original
     sig_w = pdfmetrics.stringWidth(sig_text, "Helvetica-Bold", font_reg)
-    x_sig = 750 - sig_w
+    x_sig = p2s(566.7) - sig_w  # original right edge was at pdfplumber x=566.7
 
-    # ── 3. White rectangles over signature area ─────────────────────────────
-    # Using two rectangles to ensure complete coverage:
-    # First rectangle: covers "For Yash Gallery Pvt Ltd" (main signature line)
-    white_sig_1 = b"1 1 1 rg\n540 446 255 24 re\nf\n"
-    
-    # Second rectangle: covers "(Authorised Signatory)" line below
-    white_sig_2 = b"1 1 1 rg\n600 467 195 18 re\nf\n"
+    # ── 3. White rectangle over signature area ───────────────────────────────
+    # "For Yash Gallery Pvt Ltd" at pdfplumber top=344.5, bottom=352.6
+    # White rect: covers from x=440 to x=595, top=340 to bottom=358
+    sig_sy_top = p2s(340)
+    sig_height = p2s(358) - sig_sy_top
+    white_sig = (
+        f"q\n1 1 1 rg\n"
+        f"{p2s(440):.2f} {sig_sy_top:.2f} {p2s(595-440):.2f} {sig_height+4:.2f} re\n"
+        f"f\nQ\n"
+    ).encode()
 
     parts = [
         white_header,
-        bt_block(cx_company, 47.68,  "FHB", font_bold, company),
-        bt_block(cx_address, 68.16,  "FHR", font_reg,  address),
-        bt_block(cx_gstin,   83.04,  "FHB", font_reg,  gstin_text),
-        white_sig_1,
-        white_sig_2,
-        bt_block(x_sig,      457.76, "FHB", font_reg,  sig_text),
+        # Company name baseline at pdfplumber bottom ≈ 39.1
+        bt_block(cx_company, p2s(39.1), "FHB", font_bold, company),
+        # Address baseline at pdfplumber bottom ≈ 52.8
+        bt_block(cx_address, p2s(52.8), "FHR", font_reg,  address),
+        # GSTIN baseline at pdfplumber bottom ≈ 64.0
+        bt_block(cx_gstin,   p2s(64.0), "FHB", font_reg,  gstin_text),
+        white_sig,
+        # Signature baseline at pdfplumber bottom ≈ 352.6
+        bt_block(x_sig, p2s(352.6), "FHB", font_reg, sig_text),
     ]
-    return b"".join(parts)
+    return b"\n".join(parts)
 
 
 # ── Main conversion function ──────────────────────────────────────────────────
@@ -124,10 +143,16 @@ def convert_pdf(input_bytes: bytes) -> bytes:
 
     Strategy:
       • Keep the original content stream completely intact.
-      • Append a small overlay snippet that paints white boxes over the
-        old text and draws the new text — all in the same coordinate space
-        as the original stream, so no transform arithmetic is needed.
+      • Append a small overlay snippet that:
+          - Paints white boxes over the old header and signature text
+          - Draws the new Aashirwad Garments text
+        Since the overlay is appended, it renders AFTER the original content,
+        so white boxes correctly cover old text and new text renders cleanly on top.
       • Register Helvetica / Helvetica-Bold as new font resources (/FHB, /FHR).
+
+    Note: Text extraction tools (like pdfplumber) may still show both old and
+    new text since they read raw stream data without simulating visual rendering.
+    The output PDF is visually correct — white rectangles properly hide old text.
     """
     reader = PdfReader(io.BytesIO(input_bytes))
     page   = reader.pages[0]
@@ -136,12 +161,12 @@ def convert_pdf(input_bytes: bytes) -> bytes:
     add_fonts_to_page(page)
 
     # 2. Fetch original content stream
-    obj        = get_content_object(page)
-    orig_data  = obj.get_data()
+    obj       = get_content_object(page)
+    orig_data = obj.get_data()
 
     # 3. Build and append overlay
-    overlay    = make_overlay(orig_data)
-    combined   = orig_data + b"\n" + overlay
+    overlay  = make_overlay(orig_data)
+    combined = orig_data + b"\n" + overlay
 
     # 4. Write back (compressed)
     obj._data         = zlib.compress(combined)
